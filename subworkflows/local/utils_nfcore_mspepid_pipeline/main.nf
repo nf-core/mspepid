@@ -103,24 +103,36 @@ workflow PIPELINE_INITIALISATION {
     // Create channel from input file provided through params.input
     //
 
+    // Validate FASTA source mutual exclusivity before building channels
+    def raw_rows = samplesheetToList(input, "${projectDir}/assets/schema_input.json")
+    def sheet_has_fasta = raw_rows.any  { row -> row.size() > 2 && row[2] }
+    def sheet_all_fasta = raw_rows.every { row -> row.size() > 2 && row[2] }
+
+    if (params.fasta && sheet_has_fasta) {
+        error("Conflicting FASTA sources: '--fasta' parameter and 'fasta' column in the samplesheet are mutually exclusive. Please use only one.")
+    }
+    if (!params.fasta && !sheet_has_fasta) {
+        error("No FASTA provided. Please either use '--fasta' or add a 'fasta' column to every row in the samplesheet.")
+    }
+    if (!params.fasta && sheet_has_fasta && !sheet_all_fasta) {
+        error("Incomplete FASTA column: either provide one fasta for each run in the samplesheet, or use the global '--fasta' parameter.")
+    }
+
     channel
-        .fromList(samplesheetToList(input, "${projectDir}/assets/schema_input.json"))
-        .map {
-            meta, fastq_1, fastq_2 ->
-                if (!fastq_2) {
-                    return [ meta.id, meta + [ single_end:true ], [ fastq_1 ] ]
-                } else {
-                    return [ meta.id, meta + [ single_end:false ], [ fastq_1, fastq_2 ] ]
-                }
+        .fromList(raw_rows)
+        .map { row ->
+            def meta          = row[0]
+            def spectrum_file = row[1]
+            // Resolve fasta: either from the global --fasta param or from the samplesheet column.
+            // Mutual exclusivity and completeness were already validated above.
+            def fasta_file    = params.fasta
+                ? file(params.fasta, checkIfExists: true)
+                : row[2]
+            def sample_meta   = meta + [sampleId: meta.id, id: "${meta.id}-${spectrum_file.simpleName}"]
+            return [sample_meta.id, sample_meta, spectrum_file, fasta_file]
         }
         .groupTuple()
-        .map { samplesheet ->
-            validateInputSamplesheet(samplesheet)
-        }
-        .map {
-            meta, fastqs ->
-                return [ meta, fastqs.flatten() ]
-        }
+        .map { validateInputSamplesheet(it) }
         .set { ch_samplesheet }
 
     emit:
@@ -181,15 +193,13 @@ workflow PIPELINE_COMPLETION {
 // Validate channels from input samplesheet
 //
 def validateInputSamplesheet(input) {
-    def (metas, fastqs) = input[1..2]
+    def (metas, spectra_files, fasta_files) = input[1..3]
 
-    // Check that multiple runs of the same sample are of the same datatype i.e. single-end / paired-end
-    def endedness_ok = metas.collect{ meta -> meta.single_end }.unique().size == 1
-    if (!endedness_ok) {
-        error("Please check input samplesheet -> Multiple runs of a sample must be of the same datatype i.e. single-end or paired-end: ${metas[0].id}")
+    if (spectra_files.size() != 1) {
+        error("Please check input samplesheet -> Expected exactly one 'spectrum_file' per sample row after grouping, got ${spectra_files.size()} for: ${metas[0].id}")
     }
 
-    return [ metas[0], fastqs ]
+    return [metas[0], spectra_files[0], fasta_files[0]]
 }
 //
 // Generate methods description for MultiQC
